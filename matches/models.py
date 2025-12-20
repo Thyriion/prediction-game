@@ -37,6 +37,7 @@ class Matchday(models.Model):
     order_id = models.PositiveSmallIntegerField()
     name = models.CharField(max_length=200, blank=True)
     deadline_at = models.DateTimeField(help_text="Deadline for placing/changing tips (Europe/Berlin)")
+    openligadb_last_changed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
