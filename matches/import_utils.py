@@ -20,7 +20,7 @@ def compute_deadline_before_kickoff(
     hours_before: float = 3.5
 ) -> datetime:
     """
-    Compute the tipping deadline as Friday 17:00 (5 PM) before the given earliest kickoff datetime.
+    Compute the tipping deadline as a certain number of hours before the earliest kickoff time.
     """
     if timezone.is_naive(earliest_kickoff):
         earliest_kickoff = timezone.make_aware(earliest_kickoff, timezone.get_current_timezone())
