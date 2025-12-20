@@ -5,6 +5,7 @@ from django.utils import timezone
 
 from matches.import_utils import parse_openligadb_datetime, compute_deadline_before_kickoff
 from matches.openligadb_client import OpenLigaDbClient
+from matches.models import League, Season, Matchday, Team, Match, MatchResult
 
 @dataclass
 class ImportSummary:
@@ -52,10 +53,15 @@ def bootstrap_season(
     Bootstrap the season by fetching matches and computing tipping deadlines.
     1. Fetch all matches for the given league and season.
     2. Determine the earliest kickoff time for each matchday (group).
-    3. Compute the tipping deadline as Friday 17:00 before the earliest kickoff.
+    3. Compute tipping deadlines as 3.5 hours before the earliest kickoff.
     4. Return an ImportSummary with the results.
     """
     summary = ImportSummary(league=league_shortcut, season=season_year)
+
+    league_obj = season_obj = None
+    if not dry_run:
+        league_obj, _ = League.objects.get_or_create(shortcut=league_shortcut, defaults={"name": ""})
+        season_obj, _ = Season.objects.get_or_create(league=league_obj, year=season_year)
 
     matches = client.fetch_matches_season(league_shortcut, season_year)
     summary.matches_total = len(matches)
@@ -87,7 +93,24 @@ def bootstrap_season(
         if earliest is None:
             continue
 
-        deadlines[group_id] = compute_deadline_before_kickoff(earliest)
+        deadline = compute_deadline_before_kickoff(earliest)
+        deadlines[group_id] = deadline
+        if not dry_run:
+            matchday_obj, created = Matchday.objects.get_or_create(
+                season=season_obj,
+                order_id=group_id,
+                defaults={
+                    "name": group.get("groupName") or "",
+                    "deadline_at": deadline,
+                }
+            )
+            if not created:
+                new_name = group.get("groupName") or ""
+                if matchday_obj.name != new_name:
+                    matchday_obj.name = new_name
+                    matchday_obj.save(update_fields=["name"])
+            else:
+                summary.groups_imported += 1
 
     summary.groups_with_matches = len(deadlines)
 
