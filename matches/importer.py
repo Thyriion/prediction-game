@@ -58,13 +58,22 @@ def bootstrap_season(
     """
     summary = ImportSummary(league=league_shortcut, season=season_year)
 
-    league_obj = season_obj = None
-    if not dry_run:
-        league_obj, _ = League.objects.get_or_create(shortcut=league_shortcut, defaults={"name": ""})
-        season_obj, _ = Season.objects.get_or_create(league=league_obj, year=season_year)
-
     matches = client.fetch_matches_season(league_shortcut, season_year)
     summary.matches_total = len(matches)
+
+    league_name = ""
+    if matches:
+        league_name = matches[0].get("leagueName") or ""
+    
+    league_obj = season_obj = None
+    if not dry_run:
+        league_obj, created = League.objects.get_or_create(shortcut=league_shortcut, defaults={"name": league_name})
+
+        if not created and league_name and league_obj.name != league_name:
+            league_obj.name = league_name
+            league_obj.save(update_fields=["name"])
+
+        season_obj, _ = Season.objects.get_or_create(league=league_obj, year=season_year)
 
     earliest_by_matchday: dict[int, timezone.datetime] = {}
 
