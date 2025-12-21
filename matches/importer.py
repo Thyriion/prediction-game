@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
 
-from django.utils import timezone
 from django.db import transaction
+from django.utils import timezone
 
 from matches.import_utils import parse_openligadb_datetime, compute_deadline_before_kickoff
 from matches.openligadb_client import OpenLigaDbClient
@@ -15,7 +17,6 @@ class ImportSummary:
 
     groups_total: int = 0
     groups_with_matches: int = 0
-
     matches_total: int = 0
 
     teams_created: int = 0
@@ -27,196 +28,237 @@ class ImportSummary:
 
     groups_imported: int = 0
 
+def _require_int(value: Any, *, err: str) -> int:
+    if not isinstance(value, int):
+        raise KeyError(err)
+    return value
+
+
+def _require_str(value: Any, *, err: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise KeyError(err)
+    return value
+
+def _match_id(match_json: dict[str, Any]) -> int:
+    return _require_int(
+        match_json.get("matchID"),
+        err=f"Missing matchID in match JSON: keys={list(match_json.keys())}",
+    )
+
+
 def _group_order_id(match_json: dict[str, Any]) -> int:
     group = match_json.get("group")
-    if isinstance(group, dict):
-        order_id = group.get("groupOrderID")
-        if isinstance(order_id, int):
-            return order_id
-
-    raise KeyError(f"Missing group/groupOrderID for matchID={match_json.get('matchID')}")
+    if not isinstance(group, dict):
+        raise KeyError(f"Missing group for matchID={match_json.get('matchID')}")
+    return _require_int(
+        group.get("groupOrderID"),
+        err=f"Missing group/groupOrderID for matchID={match_json.get('matchID')}",
+    )
 
 
 def _kickoff_at(match_json: dict[str, Any]) -> timezone.datetime:
-    value = match_json.get("matchDateTime")
-    if not isinstance(value, str) or not value:
-        raise KeyError(f"Missing matchDateTime for matchID={match_json.get('matchID')}")
-    return parse_openligadb_datetime(value)
+    raw = _require_str(
+        match_json.get("matchDateTime"),
+        err=f"Missing matchDateTime for matchID={match_json.get('matchID')}",
+    )
+    return parse_openligadb_datetime(raw)
 
-def _extract_team(team_json: dict[str, Any]) -> tuple[int, str, str, str]:
-    team_id = team_json.get("teamId")
-    if not isinstance(team_id, int):
-        raise KeyError(f"Missing teamId in team JSON: keys={list(team_json.keys())}")
-    
+
+def _is_finished(match_json: dict[str, Any]) -> bool:
+    return match_json.get("matchIsFinished") is True
+
+
+def _extract_team_fields(team_json: dict[str, Any]) -> tuple[int, str, str, str]:
+    team_id = _require_int(
+        team_json.get("teamId"),
+        err=f"Missing teamId in team JSON: keys={list(team_json.keys())}",
+    )
+
     name = (team_json.get("teamName") or "").strip()
     short_name = (team_json.get("shortName") or "").strip()
     icon_url = (team_json.get("teamIconUrl") or "").strip()
 
     return team_id, name, short_name, icon_url
 
-def _upsert_team(
-    *,
-    team_id: int,
-    name: str,
-    short_name: str,
-    icon_url: str,
-) -> tuple[Team, bool, bool]:
-    """
-    Returns (team, created, updated)
-    """
-    team, created = Team.objects.get_or_create(
-        openligadb_team_id=team_id,
-        defaults={
-            "name": name,
-            "short_name": short_name,
-            "icon_url": icon_url,
-        }
-    )
-
-    updated = False
-
-    if not created:
-        if name and team.name != name:
-            team.name = name
-            updated = True
-        if team.short_name != short_name:
-            team.short_name = short_name
-            updated = True
-        if team.icon_url != icon_url:
-            team.icon_url = icon_url
-            updated = True
-
-        if updated:
-            team.save(update_fields=["name", "short_name", "icon_url"])
-
-    return team, created, updated
-
-def _match_id(match_json: dict[str, Any]) -> int:
-    match_id = match_json.get("matchID")
-    if not isinstance(match_id, int):
-        raise KeyError(f"Missing matchID in match JSON: keys={list(match_json.keys())}")
-    return match_id
-
-def _is_finished(match_json: dict[str, Any]) -> bool:
-    val = match_json.get("matchIsFinished")
-    return val is True
 
 def _extract_current_score(match_json: dict[str, Any]) -> tuple[int, int] | None:
+    """
+    Returns (home_goals, away_goals) if any score is available, else None.
+
+    Priority:
+    1) goals (live progression) -> last goal has scoreTeam1/scoreTeam2
+    2) matchResults -> prefer final-ish resultName (end/final), else highest resultOrderID
+    """
     goals = match_json.get("goals") or []
     if isinstance(goals, list) and goals:
         last = goals[-1]
         if isinstance(last, dict):
-            home_goals = last.get("scoreTeam1")
-            away_goals = last.get("scoreTeam2")
-            if isinstance(home_goals, int) and isinstance(away_goals, int):
-                return home_goals, away_goals
-    
-    match_results = match_json.get("matchResults") or []
-    if not isinstance(match_results, list) or not match_results:
-        return None
-    
-    def _int(d: dict[str, Any], key: str) -> int | None:
-        val = d.get(key)
-        return val if isinstance(val, int) else None
-    
-    finals: list[tuple[int, int, int]] = []
-    for result in match_results:
-        if not isinstance(result, dict):
-            continue
+            home = last.get("scoreTeam1")
+            away = last.get("scoreTeam2")
+            if isinstance(home, int) and isinstance(away, int):
+                return home, away
 
-        name = (result.get("resultName") or "").strip().lower()
+    results = match_json.get("matchResults") or []
+    if not isinstance(results, list) or not results:
+        return None
+
+    def _int(d: dict[str, Any], key: str) -> int | None:
+        v = d.get(key)
+        return v if isinstance(v, int) else None
+
+    finals: list[tuple[int, int, int]] = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        name = (r.get("resultName") or "").strip().lower()
         if any(k in name for k in ("end", "ende", "final")):
-            home_goals = _int(result, "pointsTeam1")
-            away_goals = _int(result, "pointsTeam2")
-            order_id = result.get("resultOrderID")
-            order_id_int = order_id if isinstance(order_id, int) else -1
-            if home_goals is not None and away_goals is not None:
-                finals.append((home_goals, away_goals, order_id_int))
-    
+            h = _int(r, "pointsTeam1")
+            a = _int(r, "pointsTeam2")
+            oid = r.get("resultOrderID")
+            oid_int = oid if isinstance(oid, int) else -1
+            if h is not None and a is not None:
+                finals.append((h, a, oid_int))
+
     if finals:
         finals.sort(key=lambda t: t[2])
-        home_goals, away_goals, _ = finals[-1]
-        return home_goals, away_goals
-    
-    best: dict[str, Any] | None = None
-    best_order_id = -1
-    for result in match_results:
-        if not isinstance(result, dict):
-            continue
+        h, a, _ = finals[-1]
+        return h, a
 
-        order_id = result.get("resultOrderID")
-        order_id_int = order_id if isinstance(order_id, int) else -1
-        if order_id_int >= best_order_id:
-            best_order_id = order_id_int
-            best = result
+    best: dict[str, Any] | None = None
+    best_oid = -1
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        oid = r.get("resultOrderID")
+        oid_int = oid if isinstance(oid, int) else -1
+        if oid_int >= best_oid:
+            best_oid = oid_int
+            best = r
 
     if not best:
         return None
-    
-    home_goals = _int(best, "pointsTeam1")
-    away_goals = _int(best, "pointsTeam2")
-    if home_goals is None or away_goals is None:
+
+    h = _int(best, "pointsTeam1")
+    a = _int(best, "pointsTeam2")
+    if h is None or a is None:
         return None
-    
-    return home_goals, away_goals
+
+    return h, a
+
+def _upsert_team(*, team_id: int, name: str, short_name: str, icon_url: str) -> tuple[Team, bool, bool]:
+    """
+    Returns (team, created, updated).
+    """
+    team, created = Team.objects.get_or_create(
+        openligadb_team_id=team_id,
+        defaults={"name": name, "short_name": short_name, "icon_url": icon_url},
+    )
+
+    if created:
+        return team, True, False
+
+    updated_fields: list[str] = []
+
+    if name and team.name != name:
+        team.name = name
+        updated_fields.append("name")
+
+    if team.short_name != short_name:
+        team.short_name = short_name
+        updated_fields.append("short_name")
+
+    if team.icon_url != icon_url:
+        team.icon_url = icon_url
+        updated_fields.append("icon_url")
+
+    if updated_fields:
+        team.save(update_fields=updated_fields)
+        return team, False, True
+
+    return team, False, False
+
 
 @transaction.atomic
-def _upsert_match_result(
-    *,
-    match_obj: Match,
-    match_json: dict[str, Any],
-    summary: ImportSummary | None = None,
-) -> None:
+def _upsert_match_result(*, match_obj: Match, match_json: dict[str, Any], summary: ImportSummary | None = None) -> None:
+    """
+    Invariant: MatchResult exists only if a score exists.
+    Honest counting:
+    - results_created increments only on first create
+    - results_updated increments only when FT score actually changed
+    """
     score = _extract_current_score(match_json)
 
     if score is None:
-        deleted, _ = MatchResult.objects.filter(match=match_obj).delete()
+        MatchResult.objects.filter(match=match_obj).delete()
         return
-    
+
     home_ft, away_ft = score
 
-    obj, created = MatchResult.objects.update_or_create(
-        match=match_obj,
-        defaults={
-            "home_goals_ft": home_ft,
-            "away_goals_ft": away_ft,
-        }
+    existing = (
+        MatchResult.objects
+        .filter(match=match_obj)
+        .only("home_goals_ft", "away_goals_ft")
+        .first()
     )
 
-    if summary is not None:
-        if created:
-            summary.results_created += 1
-        else:
-            summary.results_updated += 1
+    if existing is not None:
+        if existing.home_goals_ft == home_ft and existing.away_goals_ft == away_ft:
+            return
 
-def bootstrap_season(
-    *,
-    client: OpenLigaDbClient,
-    league_shortcut: str,
-    season_year: int,
-    dry_run: bool = False,
-) -> ImportSummary:
+        existing.home_goals_ft = home_ft
+        existing.away_goals_ft = away_ft
+        existing.save(update_fields=["home_goals_ft", "away_goals_ft"])
+
+        if summary:
+            summary.results_updated += 1
+        return
+
+    MatchResult.objects.create(
+        match=match_obj,
+        home_goals_ft=home_ft,
+        away_goals_ft=away_ft,
+    )
+
+    if summary:
+        summary.results_created += 1
+
+def _compute_earliest_kickoffs(matches: list[dict[str, Any]]) -> dict[int, timezone.datetime]:
     """
-    Bootstrap the season by fetching matches and computing tipping deadlines.
-    1. Fetch all matches for the given league and season.
-    2. Determine the earliest kickoff time for each matchday (group).
-    3. Compute tipping deadlines as 3.5 hours before the earliest kickoff.
-    4. Return an ImportSummary with the results.
+    Return earliest kickoff per matchday order_id.
     """
+    earliest_by_matchday: dict[int, timezone.datetime] = {}
+
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        try:
+            md_order = _group_order_id(match)
+            kickoff = _kickoff_at(match)
+        except KeyError:
+            continue
+
+        current = earliest_by_matchday.get(md_order)
+        if current is None or kickoff < current:
+            earliest_by_matchday[md_order] = kickoff
+
+    return earliest_by_matchday
+
+def bootstrap_season(*, client: OpenLigaDbClient, league_shortcut: str, season_year: int, dry_run: bool = False) -> ImportSummary:
     summary = ImportSummary(league=league_shortcut, season=season_year)
 
     matches = client.fetch_matches_season(league_shortcut, season_year)
     summary.matches_total = len(matches)
 
-    league_name = ""
-    if matches:
-        league_name = matches[0].get("leagueName") or ""
-    
+    league_name = (matches[0].get("leagueName") or "") if matches else ""
+
     league_obj = season_obj = None
     seen_team_ids: set[int] = set()
-    if not dry_run:
-        league_obj, created = League.objects.get_or_create(shortcut=league_shortcut, defaults={"name": league_name})
 
+    if not dry_run:
+        league_obj, created = League.objects.get_or_create(
+            shortcut=league_shortcut,
+            defaults={"name": league_name},
+        )
         if not created and league_name and league_obj.name != league_name:
             league_obj.name = league_name
             league_obj.save(update_fields=["name"])
@@ -228,141 +270,288 @@ def bootstrap_season(
                 team_json = match.get(key)
                 if not isinstance(team_json, dict):
                     continue
-                
-                team_id, name, short_name, icon_url = _extract_team(team_json)
 
+                team_id, name, short_name, icon_url = _extract_team_fields(team_json)
                 if team_id in seen_team_ids:
                     continue
                 seen_team_ids.add(team_id)
 
-                _, created, updated = _upsert_team(
+                _, t_created, t_updated = _upsert_team(
                     team_id=team_id,
                     name=name,
                     short_name=short_name,
                     icon_url=icon_url,
                 )
-                if created:
+                if t_created:
                     summary.teams_created += 1
-                elif updated:
+                elif t_updated:
                     summary.teams_updated += 1
 
-    earliest_by_matchday: dict[int, timezone.datetime] = {}
-
-    for match in matches:
-        try:
-            group_id = _group_order_id(match)
-            kickoff = _kickoff_at(match)
-        except KeyError as e:
-            print(f"[bootstrap] skip match due to missing data: {e}")
-            continue
-
-        current = earliest_by_matchday.get(group_id)
-        if current is None or kickoff < current:
-            earliest_by_matchday[group_id] = kickoff
+    earliest_by_matchday = _compute_earliest_kickoffs(matches)
 
     groups = client.fetch_available_groups(league_shortcut, season_year)
     summary.groups_total = len(groups)
 
     deadlines: dict[int, timezone.datetime] = {}
+
     for group in groups:
-        group_id = group.get("groupOrderID") or group.get("groupOrderId")
-        if not isinstance(group_id, int):
+        md_order = group.get("groupOrderID") or group.get("groupOrderId")
+        if not isinstance(md_order, int):
             continue
 
-        earliest = earliest_by_matchday.get(group_id)
+        earliest = earliest_by_matchday.get(md_order)
         if earliest is None:
             continue
 
         deadline = compute_deadline_before_kickoff(earliest)
-        deadlines[group_id] = deadline
-        if not dry_run:
-            matchday_obj, created = Matchday.objects.get_or_create(
-                season=season_obj,
-                order_id=group_id,
-                defaults={
-                    "name": group.get("groupName") or "",
-                    "deadline_at": deadline,
-                }
-            )
-            if not created:
-                new_name = group.get("groupName") or ""
-                if matchday_obj.name != new_name:
-                    matchday_obj.name = new_name
-                    matchday_obj.save(update_fields=["name"])
-            else:
-                summary.groups_imported += 1
+        deadlines[md_order] = deadline
+
+        if dry_run:
+            continue
+
+        assert season_obj is not None
+        matchday_obj, created = Matchday.objects.get_or_create(
+            season=season_obj,
+            order_id=md_order,
+            defaults={
+                "name": group.get("groupName") or "",
+                "deadline_at": deadline,
+            },
+        )
+
+        new_name = group.get("groupName") or ""
+        if not created and matchday_obj.name != new_name:
+            matchday_obj.name = new_name
+            matchday_obj.save(update_fields=["name"])
+
+        if created:
+            summary.groups_imported += 1
 
     summary.groups_with_matches = len(deadlines)
 
     if dry_run:
-
         sample = sorted(deadlines.items(), key=lambda item: item[0])[:5]
         print(f"[bootstrap] league={league_shortcut} season={season_year}")
         print(f"groups: {summary.groups_total}, with matches: {summary.groups_with_matches}")
         print(f"matches: {summary.matches_total}")
         if sample:
             print("sample deadlines (matchday -> deadline_at):")
-            for group_id, deadline in sample:
-                print(f"  {group_id:>2} -> {deadline.isoformat()}")
+            for md_order, deadline in sample:
+                print(f"  {md_order:>2} -> {deadline.isoformat()}")
+        return summary
 
-    if not dry_run:
-        assert season_obj is not None
+    assert season_obj is not None
 
-        matchday_by_order: dict[int, Matchday] = {
-            md.order_id: md
-            for md in Matchday.objects.filter(season=season_obj)
-        }
+    matchday_by_order: dict[int, Matchday] = {md.order_id: md for md in Matchday.objects.filter(season=season_obj)}
+    team_by_id: dict[int, Team] = {
+        team.openligadb_team_id: team
+        for team in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
+    }
 
-        team_by_id: dict[int, Team] = {
-            team.openligadb_team_id: team
-            for team in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
-        }
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
 
-        for match in matches:
-            try:
-                openligadb_match_id = _match_id(match)
-                group_id = _group_order_id(match)
-                kickoff_at = _kickoff_at(match)
+        try:
+            openligadb_match_id = _match_id(match)
+            md_order = _group_order_id(match)
+            kickoff_at = _kickoff_at(match)
 
-                team1 = match.get("team1")
-                team2 = match.get("team2")
+            team1 = match.get("team1")
+            team2 = match.get("team2")
+            if not isinstance(team1, dict) or not isinstance(team2, dict):
+                raise KeyError("Missing team1/team2 data")
 
-                if not isinstance(team1, dict) or not isinstance(team2, dict):
-                    raise KeyError("Missing team1 or team2 data")
-                
-                home_id, *_ = _extract_team(team1)
-                away_id, *_ = _extract_team(team2)
+            home_id, *_ = _extract_team_fields(team1)
+            away_id, *_ = _extract_team_fields(team2)
 
-                matchday_obj = matchday_by_order[group_id]
-                home_team = team_by_id[home_id]
-                away_team = team_by_id[away_id]
-            except Exception as e:
-                print(f"[bootstrap] skip match due to missing data: {e}")
-                continue
+            matchday_obj = matchday_by_order[md_order]
+            home_team = team_by_id[home_id]
+            away_team = team_by_id[away_id]
+        except Exception as e:
+            print(f"[bootstrap] skip match due to missing data: {e}")
+            continue
 
-            match_obj, created = Match.objects.update_or_create(
-                openligadb_match_id=openligadb_match_id,
-                defaults={
-                    "matchday": matchday_obj,
-                    "kickoff_at": kickoff_at,
-                    "home_team": home_team,
-                    "away_team": away_team,
-                    "is_finished": _is_finished(match),
-                }
-            )
+        match_obj, created = Match.objects.update_or_create(
+            openligadb_match_id=openligadb_match_id,
+            defaults={
+                "matchday": matchday_obj,
+                "kickoff_at": kickoff_at,
+                "home_team": home_team,
+                "away_team": away_team,
+                "is_finished": _is_finished(match),
+            },
+        )
 
-            if created:
-                summary.matches_created += 1
-            else:
-                summary.matches_updated += 1
+        if created:
+            summary.matches_created += 1
+        else:
+            summary.matches_updated += 1
 
-            _upsert_match_result(
-                match_obj=match_obj,
-                match_json=match,
-                summary=summary,
-            )
+        _upsert_match_result(match_obj=match_obj, match_json=match, summary=summary)
 
     return summary
+
+def _parse_last_changed(value: str) -> timezone.datetime:
+    return parse_openligadb_datetime(value)
+
+
+def _get_season_or_raise(*, league_shortcut: str, season_year: int) -> Season:
+    try:
+        league = League.objects.get(shortcut=league_shortcut)
+    except League.DoesNotExist as e:
+        raise RuntimeError(f"League '{league_shortcut}' not found. Run bootstrap_season first.") from e
+
+    try:
+        return Season.objects.get(league=league, year=season_year)
+    except Season.DoesNotExist as e:
+        raise RuntimeError(f"Season {league_shortcut} {season_year} not found. Run bootstrap_season first.") from e
+
+
+def _compute_earliest_kickoff(matches: list[dict[str, Any]]) -> timezone.datetime | None:
+    earliest: timezone.datetime | None = None
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        try:
+            kickoff = _kickoff_at(m)
+        except Exception:
+            continue
+        if earliest is None or kickoff < earliest:
+            earliest = kickoff
+    return earliest
+
+
+def _ensure_matchday(
+    *,
+    season: Season,
+    group_json: dict[str, Any],
+    matches_in_group: list[dict[str, Any]],
+    summary: ImportSummary,
+) -> Matchday | None:
+    group_id = group_json.get("groupOrderID") or group_json.get("groupOrderId")
+    if not isinstance(group_id, int):
+        return None
+
+    earliest = _compute_earliest_kickoff(matches_in_group)
+    if earliest is None:
+        return None
+
+    deadline = compute_deadline_before_kickoff(earliest)
+    name = (group_json.get("groupName") or "").strip()
+
+    matchday, created = Matchday.objects.get_or_create(
+        season=season,
+        order_id=group_id,
+        defaults={
+            "name": name,
+            "deadline_at": deadline,
+        },
+    )
+
+    if created:
+        summary.groups_imported += 1
+    else:
+        if name and matchday.name != name:
+            matchday.name = name
+            matchday.save(update_fields=["name"])
+
+    return matchday
+
+
+@transaction.atomic
+def _import_one_matchday(
+    *,
+    season: Season,
+    group_json: dict[str, Any],
+    matches_in_group: list[dict[str, Any]],
+    last_changed_at: timezone.datetime,
+    summary: ImportSummary,
+) -> None:
+    matchday = _ensure_matchday(
+        season=season,
+        group_json=group_json,
+        matches_in_group=matches_in_group,
+        summary=summary,
+    )
+    if matchday is None:
+        return
+
+    matchday = Matchday.objects.select_for_update().get(pk=matchday.pk)
+
+    seen_team_ids: set[int] = set()
+
+    for m in matches_in_group:
+        if not isinstance(m, dict):
+            continue
+        for key in ("team1", "team2"):
+            team_json = m.get(key)
+            if not isinstance(team_json, dict):
+                continue
+
+            team_id, name, short_name, icon_url = _extract_team_fields(team_json)
+            if team_id in seen_team_ids:
+                continue
+            seen_team_ids.add(team_id)
+
+            _, created, updated = _upsert_team(
+                team_id=team_id,
+                name=name,
+                short_name=short_name,
+                icon_url=icon_url,
+            )
+            if created:
+                summary.teams_created += 1
+            elif updated:
+                summary.teams_updated += 1
+
+    team_by_id: dict[int, Team] = {
+        t.openligadb_team_id: t
+        for t in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
+    }
+
+    for m in matches_in_group:
+        if not isinstance(m, dict):
+            continue
+
+        try:
+            openligadb_match_id = _match_id(m)
+            kickoff_at = _kickoff_at(m)
+
+            team1 = m.get("team1")
+            team2 = m.get("team2")
+            if not isinstance(team1, dict) or not isinstance(team2, dict):
+                raise KeyError("Missing team1/team2")
+
+            home_id, *_ = _extract_team_fields(team1)
+            away_id, *_ = _extract_team_fields(team2)
+
+            home_team = team_by_id[home_id]
+            away_team = team_by_id[away_id]
+        except Exception as e:
+            print(f"[update] skip match due to missing data: {e}")
+            continue
+
+        match_obj, created = Match.objects.update_or_create(
+            openligadb_match_id=openligadb_match_id,
+            defaults={
+                "matchday": matchday,
+                "kickoff_at": kickoff_at,
+                "home_team": home_team,
+                "away_team": away_team,
+                "is_finished": _is_finished(m),
+            },
+        )
+
+        if created:
+            summary.matches_created += 1
+        else:
+            summary.matches_updated += 1
+
+        _upsert_match_result(match_obj=match_obj, match_json=m, summary=summary)
+
+    matchday.openligadb_last_changed_at = last_changed_at
+    matchday.save(update_fields=["openligadb_last_changed_at"])
 
 def update_season_smart(
     *,
@@ -372,25 +561,64 @@ def update_season_smart(
     dry_run: bool = False,
 ) -> ImportSummary:
     summary = ImportSummary(league=league_shortcut, season=season_year)
+    season = _get_season_or_raise(league_shortcut=league_shortcut, season_year=season_year)
 
     groups = client.fetch_available_groups(league_shortcut, season_year)
     summary.groups_total = len(groups)
 
-    changed_samples: list[tuple[int, str]] = []
+    changed_groups = 0
+    matches_seen = 0
+    planned: list[tuple[int, str]] = []
 
     for group in groups:
         group_id = group.get("groupOrderID") or group.get("groupOrderId")
         if not isinstance(group_id, int):
             continue
 
-        last_changed = client.fetch_last_changed(league_shortcut, season_year, group_id)
-        changed_samples.append((group_id, last_changed))
+        last_changed_raw = client.fetch_last_changed(league_shortcut, season_year, group_id)
+        try:
+            last_changed_at = _parse_last_changed(last_changed_raw)
+        except Exception as e:
+            print(f"[update] skip group {group_id}: cannot parse lastChanged '{last_changed_raw}': {e}")
+            continue
+
+        md = (
+            Matchday.objects
+            .filter(season=season, order_id=group_id)
+            .only("openligadb_last_changed_at")
+            .first()
+        )
+        db_last_changed = md.openligadb_last_changed_at if md else None
+
+        has_changed = db_last_changed is None or last_changed_at > db_last_changed
+        if not has_changed:
+            continue
+
+        changed_groups += 1
+        planned.append((group_id, last_changed_raw))
+
+        if dry_run:
+            continue
+
+        matches_in_group = client.fetch_matches_matchday(league_shortcut, season_year, group_id)
+        matches_seen += len(matches_in_group)
+
+        _import_one_matchday(
+            season=season,
+            group_json=group,
+            matches_in_group=matches_in_group,
+            last_changed_at=last_changed_at,
+            summary=summary,
+        )
+
+    summary.groups_with_matches = changed_groups
+    summary.matches_total = matches_seen
 
     if dry_run:
         print(f"[update] league={league_shortcut} season={season_year}")
-        print(f"groups checked: {len(changed_samples)}")
-
-        for group_id, last_changed in sorted(changed_samples)[:5]:
-            print(f"  group {group_id:>2} last changed at {last_changed}")
+        print(f"groups checked: {summary.groups_total}")
+        print(f"groups changed: {len(planned)}")
+        for group_id, last_changed in sorted(planned)[:10]:
+            print(f"  group {group_id:>2} changed at {last_changed}")
 
     return summary
