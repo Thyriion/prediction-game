@@ -90,6 +90,16 @@ def _upsert_team(
 
     return team, created, updated
 
+def _match_id(match_json: dict[str, Any]) -> int:
+    match_id = match_json.get("matchID")
+    if not isinstance(match_id, int):
+        raise KeyError(f"Missing matchID in match JSON: keys={list(match_json.keys())}")
+    return match_id
+
+def _is_finished(match_json: dict[str, Any]) -> bool:
+    val = match_json.get("matchIsFinished")
+    return bool(val)
+
 def bootstrap_season(
     *,
     client: OpenLigaDbClient,
@@ -114,6 +124,7 @@ def bootstrap_season(
         league_name = matches[0].get("leagueName") or ""
     
     league_obj = season_obj = None
+    seen_team_ids: set[int] = set()
     if not dry_run:
         league_obj, created = League.objects.get_or_create(shortcut=league_shortcut, defaults={"name": league_name})
 
@@ -122,8 +133,6 @@ def bootstrap_season(
             league_obj.save(update_fields=["name"])
 
         season_obj, _ = Season.objects.get_or_create(league=league_obj, year=season_year)
-
-        seen_team_ids: set[int] = set()
 
         for match in matches:
             for key in ("team1", "team2"):
@@ -206,6 +215,57 @@ def bootstrap_season(
             print("sample deadlines (matchday -> deadline_at):")
             for group_id, deadline in sample:
                 print(f"  {group_id:>2} -> {deadline.isoformat()}")
+
+    if not dry_run:
+        assert season_obj is not None
+
+        matchday_by_order: dict[int, Matchday] = {
+            md.order_id: md
+            for md in Matchday.objects.filter(season=season_obj)
+        }
+
+        team_by_id: dict[int, Team] = {
+            team.openligadb_team_id: team
+            for team in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
+        }
+
+        for match in matches:
+            try:
+                openligadb_match_id = _match_id(match)
+                group_id = _group_order_id(match)
+                kickoff_at = _kickoff_at(match)
+
+                team1 = match.get("team1")
+                team2 = match.get("team2")
+
+                if not isinstance(team1, dict) or not isinstance(team2, dict):
+                    raise KeyError("Missing team1 or team2 data")
+                
+                home_id, *_ = _extract_team(team1)
+                away_id, *_ = _extract_team(team2)
+
+                matchday_obj = matchday_by_order[group_id]
+                home_team = team_by_id[home_id]
+                away_team = team_by_id[away_id]
+            except Exception as e:
+                print(f"[bootstrap] skip match due to missing data: {e}")
+                continue
+
+            obj, created = Match.objects.update_or_create(
+                openligadb_match_id=openligadb_match_id,
+                defaults={
+                    "matchday": matchday_obj,
+                    "kickoff_at": kickoff_at,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "is_finished": _is_finished(match),
+                }
+            )
+
+            if created:
+                summary.matches_created += 1
+            else:
+                summary.matches_updated += 1
 
     return summary
 
