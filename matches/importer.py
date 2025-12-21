@@ -42,6 +42,54 @@ def _kickoff_at(match_json: dict[str, Any]) -> timezone.datetime:
         raise KeyError(f"Missing matchDateTime for matchID={match_json.get('matchID')}")
     return parse_openligadb_datetime(value)
 
+def _extract_team(team_json: dict[str, Any]) -> tuple[int, str, str, str]:
+    team_id = team_json.get("teamId")
+    if not isinstance(team_id, int):
+        raise KeyError(f"Missing teamId in team JSON: keys={list(team_json.keys())}")
+    
+    name = (team_json.get("teamName") or "").strip()
+    short_name = (team_json.get("shortName") or "").strip()
+    icon_url = (team_json.get("teamIconUrl") or "").strip()
+
+    return team_id, name, short_name, icon_url
+
+def _upsert_team(
+    *,
+    team_id: int,
+    name: str,
+    short_name: str,
+    icon_url: str,
+) -> tuple[Team, bool, bool]:
+    """
+    Returns (team, created, updated)
+    """
+    team, created = Team.objects.get_or_create(
+        openligadb_team_id=team_id,
+        defaults={
+            "name": name,
+            "short_name": short_name,
+            "icon_url": icon_url,
+        }
+    )
+
+    updated = False
+
+    if not created:
+        if name and team.name != name:
+            team.name = name
+            updated = True
+        if team.short_name != short_name:
+            team.short_name = short_name
+            updated = True
+        if team.icon_url != icon_url:
+            team.icon_url = icon_url
+            updated = True
+
+        if updated:
+            team.save(update_fields=["name", "short_name", "icon_url"])
+
+    return team, created, updated
+
 def bootstrap_season(
     *,
     client: OpenLigaDbClient,
@@ -74,6 +122,31 @@ def bootstrap_season(
             league_obj.save(update_fields=["name"])
 
         season_obj, _ = Season.objects.get_or_create(league=league_obj, year=season_year)
+
+        seen_team_ids: set[int] = set()
+
+        for match in matches:
+            for key in ("team1", "team2"):
+                team_json = match.get(key)
+                if not isinstance(team_json, dict):
+                    continue
+                
+                team_id, name, short_name, icon_url = _extract_team(team_json)
+
+                if team_id in seen_team_ids:
+                    continue
+                seen_team_ids.add(team_id)
+
+                _, created, updated = _upsert_team(
+                    team_id=team_id,
+                    name=name,
+                    short_name=short_name,
+                    icon_url=icon_url,
+                )
+                if created:
+                    summary.teams_created += 1
+                elif updated:
+                    summary.teams_updated += 1
 
     earliest_by_matchday: dict[int, timezone.datetime] = {}
 
