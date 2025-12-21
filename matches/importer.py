@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.utils import timezone
+from django.db import transaction
 
 from matches.import_utils import parse_openligadb_datetime, compute_deadline_before_kickoff
 from matches.openligadb_client import OpenLigaDbClient
@@ -98,7 +99,95 @@ def _match_id(match_json: dict[str, Any]) -> int:
 
 def _is_finished(match_json: dict[str, Any]) -> bool:
     val = match_json.get("matchIsFinished")
-    return bool(val)
+    return val is True
+
+def _extract_current_score(match_json: dict[str, Any]) -> tuple[int, int] | None:
+    goals = match_json.get("goals") or []
+    if isinstance(goals, list) and goals:
+        last = goals[-1]
+        if isinstance(last, dict):
+            home_goals = last.get("scoreTeam1")
+            away_goals = last.get("scoreTeam2")
+            if isinstance(home_goals, int) and isinstance(away_goals, int):
+                return home_goals, away_goals
+    
+    match_results = match_json.get("matchResults") or []
+    if not isinstance(match_results, list) or not match_results:
+        return None
+    
+    def _int(d: dict[str, Any], key: str) -> int | None:
+        val = d.get(key)
+        return val if isinstance(val, int) else None
+    
+    finals: list[tuple[int, int, int]] = []
+    for result in match_results:
+        if not isinstance(result, dict):
+            continue
+
+        name = (result.get("resultName") or "").strip().lower()
+        if any(k in name for k in ("end", "ende", "final")):
+            home_goals = _int(result, "pointsTeam1")
+            away_goals = _int(result, "pointsTeam2")
+            order_id = result.get("resultOrderID")
+            order_id_int = order_id if isinstance(order_id, int) else -1
+            if home_goals is not None and away_goals is not None:
+                finals.append((home_goals, away_goals, order_id_int))
+    
+    if finals:
+        finals.sort(key=lambda t: t[2])
+        home_goals, away_goals, _ = finals[-1]
+        return home_goals, away_goals
+    
+    best: dict[str, Any] | None = None
+    best_order_id = -1
+    for result in match_results:
+        if not isinstance(result, dict):
+            continue
+
+        order_id = result.get("resultOrderID")
+        order_id_int = order_id if isinstance(order_id, int) else -1
+        if order_id_int >= best_order_id:
+            best_order_id = order_id_int
+            best = result
+
+    if not best:
+        return None
+    
+    home_goals = _int(best, "pointsTeam1")
+    away_goals = _int(best, "pointsTeam2")
+    if home_goals is None or away_goals is None:
+        return None
+    
+    return home_goals, away_goals
+
+@transaction.atomic
+def _upsert_match_result(
+    *,
+    match_obj: Match,
+    match_json: dict[str, Any],
+    summary: ImportSummary | None = None,
+) -> None:
+    score = _extract_current_score(match_json)
+
+    if score is None:
+        deleted, _ = MatchResult.objects.filter(match=match_obj).delete()
+        return
+    
+    home_ft, away_ft = score
+
+    obj, created = MatchResult.objects.update_or_create(
+        match=match_obj,
+        defaults={
+            "home_goals_ft": home_ft,
+            "away_goals_ft": away_ft,
+        }
+    )
+
+    if summary is not None:
+        if created:
+            summary.results_created += 1
+        else:
+            summary.results_updated += 1
 
 def bootstrap_season(
     *,
@@ -251,7 +340,7 @@ def bootstrap_season(
                 print(f"[bootstrap] skip match due to missing data: {e}")
                 continue
 
-            obj, created = Match.objects.update_or_create(
+            match_obj, created = Match.objects.update_or_create(
                 openligadb_match_id=openligadb_match_id,
                 defaults={
                     "matchday": matchday_obj,
@@ -266,6 +355,12 @@ def bootstrap_season(
                 summary.matches_created += 1
             else:
                 summary.matches_updated += 1
+
+            _upsert_match_result(
+                match_obj=match_obj,
+                match_json=match,
+                summary=summary,
+            )
 
     return summary
 
