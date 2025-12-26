@@ -1,0 +1,89 @@
+<div
+  class="mt-6"
+  hx-get="{% url 'leaderboard:season_bl1_partial' %}"
+  hx-trigger="every 20s"
+  hx-swap="outerHTML"
+>
+    <div class="text-xs text-slate-500 mt-2">
+        Updated: {% now "Y-m-d H:i:s" %}
+    </div>
+    {% if status %}
+        <div class="mb-3 flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2">
+
+            {% if status.state == "live" %}
+                <span class="flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-1 text-emerald-200">
+                <span class="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                Live
+                </span>
+                <span class="text-slate-300">
+                Matchday {{ status.active_matchday.order_id }}
+                </span>
+
+            {% elif status.state == "upcoming" %}
+                <span class="rounded-full bg-sky-500/20 px-2 py-1 text-sky-200">
+                Upcoming
+                </span>
+                <span class="text-slate-300">
+                Next kickoff {{ status.next_kickoff_at|date:"D H:i" }}
+                </span>
+
+            {% else %}
+                <span class="rounded-full bg-slate-500/20 px-2 py-1 text-slate-300">
+                Idle
+                </span>
+                <span class="text-slate-400">
+                No live matches
+                </span>
+            {% endif %}
+
+            </div>
+
+            {% if status.state == "live" %}
+            <div class="text-slate-400">
+                Auto-refreshing
+            </div>
+            {% endif %}
+        </div>
+    {% endif %}
+
+
+    <div class="overflow-hidden rounded-2xl border border-slate-800">
+    <table class="w-full text-sm">
+        <thead class="bg-slate-900/60 text-slate-300">
+        <tr>
+            <th class="px-4 py-3 text-left font-medium w-16">#</th>
+            <th class="px-4 py-3 text-left font-medium">Player</th>
+            <th class="px-4 py-3 text-right font-medium w-28">Points</th>
+            <th class="px-4 py-3 text-right font-medium w-28">Tips</th>
+            <th class="px-4 py-3 text-right font-medium w-28">Bonus</th>
+        </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-800 bg-slate-950/30">
+        {% if rows %}
+            {% for r in rows %}
+                {% if request.user.is_authenticated and r.user_id == request.user.id %}
+                    <tr class="bg-amber-500/10">
+                {% else %}
+                    <tr class="hover:bg-slate-900/30">
+                {% endif %}
+                <td class="px-4 py-3 text-slate-400">{{ forloop.counter }}</td>
+                <td class="px-4 py-3">
+                <span class="font-medium text-slate-100">{{ r.display_name }}</span>
+                </td>
+                <td class="px-4 py-3 text-right font-semibold">{{ r.points }}</td>
+                <td class="px-4 py-3 text-right text-slate-200">{{ r.tips_points }}</td>
+                <td class="px-4 py-3 text-right text-slate-200">{{ r.bonus_points }}</td>
+            </tr>
+            {% endfor %}
+        {% else %}
+            <tr>
+            <td colspan="5" class="px-4 py-6 text-slate-300">
+                No leaderboard entries yet.
+            </td>
+            </tr>
+        {% endif %}
+        </tbody>
+    </table>
+    </div>
+</div>

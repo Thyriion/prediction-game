@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Leaderboard{% endblock %}
+
+{% block content %}
+  <div class="flex items-end justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-semibold">Leaderboard</h1>
+      <p class="mt-1 text-sm text-slate-300">
+        League: <span class="font-medium text-slate-200">{{ league_shortcut|upper }}</span>
+        {% if season %}
+          • Season: <span class="font-medium text-slate-200">{{ season.year }}</span>
+        {% endif %}
+      </p>
+    </div>
+
+    <div class="text-xs text-slate-400">
+      Generated: {{ generated_at|date:"Y-m-d H:i" }}
+    </div>
+  </div>
+
+  {% if not season %}
+    <div class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
+      <p class="text-slate-200 font-medium">No data yet</p>
+      <p class="mt-2 text-slate-300 text-sm">{{ empty_reason }}</p>
+
+      <pre class="mt-4 rounded-xl bg-slate-950/60 p-4 text-xs text-slate-300 overflow-x-auto">python manage.py import_openligadb --league bl1 --mode bootstrap</pre>
+    </div>
+  {% else %}
+
+    {% include "leaderboard/_table.html" with rows=rows season=season status=status %}
+
+{% endif %}
+{% endblock %}
