@@ -8,7 +8,7 @@ from django.utils import timezone
 from matches.import_utils import parse_openligadb_datetime
 from matches.openligadb_client import OpenLigaDbClient
 from matches.importer import bootstrap_season, update_season_smart
-
+from matches.models import Season
 
 def _group_id(group_json: dict[str, Any]) -> int | None:
     """
@@ -16,7 +16,6 @@ def _group_id(group_json: dict[str, Any]) -> int | None:
     """
     gid = group_json.get("groupOrderID") or group_json.get("groupOrderId")
     return gid if isinstance(gid, int) else None
-
 
 def _iter_kickoffs_from_matchday_payload(matches: list[dict[str, Any]]):
     """
@@ -35,7 +34,6 @@ def _iter_kickoffs_from_matchday_payload(matches: list[dict[str, Any]]):
         except Exception:
             continue
 
-
 def determine_active_season(
     *,
     client: OpenLigaDbClient,
@@ -44,13 +42,13 @@ def determine_active_season(
     now: timezone.datetime | None = None,
 ) -> int:
     """
-    Determine the active season year for a given league by inspecting match kickoff dates.
-    We look for the nearest upcoming match; if none, we fall back to the most recent past match.
+    Determine the active season year for the given league by inspecting match kickoff times.
     """
     now = now or timezone.now()
 
-    best_upcoming: tuple[timezone.datetime, int] | None = None 
-    best_recent: tuple[timezone.datetime, int] | None = None 
+    best_upcoming: tuple[timezone.datetime, int] | None = None
+    best_recent: tuple[timezone.datetime, int] | None = None
+
     for year in sorted(candidate_years, reverse=True):
         try:
             groups = client.fetch_available_groups(league_shortcut, year)
@@ -80,7 +78,6 @@ def determine_active_season(
 
     if best_upcoming is not None:
         return best_upcoming[1]
-
     if best_recent is not None:
         return best_recent[1]
 
@@ -89,6 +86,37 @@ def determine_active_season(
         f"Tried candidate years: {sorted(candidate_years, reverse=True)}"
     )
 
+def _resolve_season_year(
+    *,
+    league_shortcut: str,
+    requested: int | None,
+    client: OpenLigaDbClient,
+) -> tuple[int, str]:
+    """
+    Resolve the season year to import for the given league.
+    """
+    if requested is not None:
+        return int(requested), "cli"
+
+    db_year = (
+        Season.objects
+        .filter(league__shortcut=league_shortcut)
+        .order_by("-year")
+        .values_list("year", flat=True)
+        .first()
+    )
+    if db_year is not None:
+        return int(db_year), "db"
+
+    now = timezone.now()
+    candidate_years = [now.year + 1, now.year, now.year - 1]
+    api_year = determine_active_season(
+        client=client,
+        league_shortcut=league_shortcut,
+        candidate_years=candidate_years,
+        now=now,
+    )
+    return int(api_year), "api"
 
 class Command(BaseCommand):
     help = "Imports match data from OpenLigaDB"
@@ -107,7 +135,7 @@ class Command(BaseCommand):
             default=None,
             help=(
                 "Season year to import (e.g. 2025). Optional. "
-                "If omitted, the active season is detected from OpenLigaDB."
+                "If omitted, we use DB latest season (fast) and fall back to OpenLigaDB detection (slow)."
             ),
         )
 
@@ -137,24 +165,34 @@ class Command(BaseCommand):
         dry_run: bool = bool(options["dry_run"])
         timeout: int = int(options["timeout"])
 
+        self.stdout.write(
+            self.style.NOTICE(
+                f"[import_openligadb] starting league={league} mode={mode} dry_run={dry_run} timeout={timeout}s"
+            )
+        )
+        self.stdout.flush()
+
         client = OpenLigaDbClient(timeout_seconds=timeout)
 
-        season_year = options.get("season")
-        if season_year is None:
-            now = timezone.now()
-            candidate_years = [now.year + 1, now.year, now.year - 1]
-            season_year = determine_active_season(
-                client=client,
+        try:
+            season_year, season_source = _resolve_season_year(
                 league_shortcut=league,
-                candidate_years=candidate_years,
-                now=now,
+                requested=options.get("season"),
+                client=client,
             )
+        except Exception as e:
+            raise CommandError(f"Failed to resolve season year: {e}") from e
+
+        if season_source == "api":
+            self.stdout.write(self.style.NOTICE("[import_openligadb] season auto-detected via API (slow path)"))
+            self.stdout.flush()
 
         self.stdout.write(
             self.style.NOTICE(
-                f"[import_openligadb] league={league} season={season_year} mode={mode} dry_run={dry_run}"
+                f"[import_openligadb] league={league} season={season_year} season_source={season_source} mode={mode} dry_run={dry_run}"
             )
         )
+        self.stdout.flush()
 
         try:
             if mode == "bootstrap":
@@ -173,7 +211,6 @@ class Command(BaseCommand):
                 )
             else:
                 raise CommandError(f"Unknown import mode: {mode}")
-
         except Exception as e:
             raise CommandError(str(e)) from e
 
