@@ -1,5 +1,6 @@
 from django.db import models
 from django.utils import timezone
+from datetime import datetime
 
 # Create your models here.
 
@@ -38,6 +39,24 @@ class Matchday(models.Model):
     name = models.CharField(max_length=200, blank=True)
     deadline_at = models.DateTimeField(help_text="Deadline for placing/changing tips (Europe/Berlin)")
     openligadb_last_changed_at = models.DateTimeField(null=True, blank=True)
+    first_goal_match = models.ForeignKey(
+        "Match",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="The match in which the first goal of the matchday was scored.",
+    )
+    first_goal_minute = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="The minute in which the first goal of the matchday was scored.",
+    )
+    first_goal_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="The timestamp when the first goal of the matchday was scored.",
+    )
 
     class Meta:
         constraints = [
@@ -49,7 +68,7 @@ class Matchday(models.Model):
         label = self.name or f"Matchday {self.order_id}"
         return f"{self.season} - {label}"
     
-    def is_open_for_tipping(self, at: timezone.datetime | None = None):
+    def is_open_for_tipping(self, at: datetime | None = None):
         now = at or timezone.now()
         return now <= self.deadline_at
     
