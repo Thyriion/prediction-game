@@ -1,6 +1,8 @@
+# matches/importer.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from django.db import transaction
@@ -9,6 +11,8 @@ from django.utils import timezone
 from matches.import_utils import parse_openligadb_datetime, compute_deadline_before_kickoff
 from matches.openligadb_client import OpenLigaDbClient
 from matches.models import League, Season, Matchday, Team, Match, MatchResult
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 @dataclass
 class ImportSummary:
@@ -33,7 +37,6 @@ def _require_int(value: Any, *, err: str) -> int:
         raise KeyError(err)
     return value
 
-
 def _require_str(value: Any, *, err: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise KeyError(err)
@@ -45,7 +48,6 @@ def _match_id(match_json: dict[str, Any]) -> int:
         err=f"Missing matchID in match JSON: keys={list(match_json.keys())}",
     )
 
-
 def _group_order_id(match_json: dict[str, Any]) -> int:
     group = match_json.get("group")
     if not isinstance(group, dict):
@@ -55,7 +57,6 @@ def _group_order_id(match_json: dict[str, Any]) -> int:
         err=f"Missing group/groupOrderID for matchID={match_json.get('matchID')}",
     )
 
-
 def _kickoff_at(match_json: dict[str, Any]) -> timezone.datetime:
     raw = _require_str(
         match_json.get("matchDateTime"),
@@ -63,10 +64,8 @@ def _kickoff_at(match_json: dict[str, Any]) -> timezone.datetime:
     )
     return parse_openligadb_datetime(raw)
 
-
 def _is_finished(match_json: dict[str, Any]) -> bool:
     return match_json.get("matchIsFinished") is True
-
 
 def _extract_team_fields(team_json: dict[str, Any]) -> tuple[int, str, str, str]:
     team_id = _require_int(
@@ -79,7 +78,6 @@ def _extract_team_fields(team_json: dict[str, Any]) -> tuple[int, str, str, str]
     icon_url = (team_json.get("teamIconUrl") or "").strip()
 
     return team_id, name, short_name, icon_url
-
 
 def _extract_current_score(match_json: dict[str, Any]) -> tuple[int, int] | None:
     """
@@ -144,6 +142,78 @@ def _extract_current_score(match_json: dict[str, Any]) -> tuple[int, int] | None
         return None
 
     return h, a
+
+def _extract_first_goal_minute_for_match(match_json: dict[str, Any]) -> int | None:
+    """
+    Returns the minute of the FIRST goal in THIS match, if available.
+    We use this to compute the FIRST goal of the whole matchday (chronological).
+    """
+    goals = match_json.get("goals")
+    if not isinstance(goals, list) or not goals:
+        return None
+
+    for g in goals:
+        if not isinstance(g, dict):
+            continue
+        minute = g.get("matchMinute")
+        if isinstance(minute, int) and 0 <= minute <= 130:
+            return minute
+
+    return None
+
+
+def _compute_matchday_first_goal(
+    *,
+    matchday_obj: Matchday,
+    match_rows: list[tuple[Match, dict[str, Any]]],
+) -> None:
+    """
+    Computes and stores:
+      - matchday.first_goal_at     (absolute timestamp)
+      - matchday.first_goal_match  (FK to Match)
+      - matchday.first_goal_minute (minute within that match)
+
+    "First goal of matchday" means: chronologically first goal across all matches of that matchday.
+    We approximate absolute time as kickoff_at + matchMinute.
+    """
+    best: tuple[timezone.datetime, Match, int] | None = None  
+
+    for match_obj, match_json in match_rows:
+        minute = _extract_first_goal_minute_for_match(match_json)
+        if minute is None:
+            continue
+
+        goal_at = match_obj.kickoff_at + timedelta(minutes=minute)
+
+        if best is None or goal_at < best[0]:
+            best = (goal_at, match_obj, minute)
+
+    if best is None:
+        if (
+            matchday_obj.first_goal_at is not None
+            or matchday_obj.first_goal_match is not None
+            or matchday_obj.first_goal_minute is not None
+        ):
+            matchday_obj.first_goal_at = None
+            matchday_obj.first_goal_match = None
+            matchday_obj.first_goal_minute = None
+            matchday_obj.save(update_fields=["first_goal_at", "first_goal_match", "first_goal_minute"])
+        return
+
+    goal_at, match_obj, minute = best
+
+    current_match_pk = matchday_obj.first_goal_match.pk if matchday_obj.first_goal_match else None
+
+    if (
+        matchday_obj.first_goal_at != goal_at
+        or current_match_pk != match_obj.pk
+        or matchday_obj.first_goal_minute != minute
+    ):
+        matchday_obj.first_goal_at = goal_at
+        matchday_obj.first_goal_match = match_obj # type: ignore[type-arg]
+        matchday_obj.first_goal_minute = minute
+        matchday_obj.save(update_fields=["first_goal_at", "first_goal_match", "first_goal_minute"])
+
 
 def _upsert_team(*, team_id: int, name: str, short_name: str, icon_url: str) -> tuple[Team, bool, bool]:
     """
@@ -348,6 +418,8 @@ def bootstrap_season(*, client: OpenLigaDbClient, league_shortcut: str, season_y
         for team in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
     }
 
+    matchday_rows: dict[int, list[tuple[Match, dict[str, Any]]]] = {}
+
     for match in matches:
         if not isinstance(match, dict):
             continue
@@ -390,7 +462,16 @@ def bootstrap_season(*, client: OpenLigaDbClient, league_shortcut: str, season_y
 
         _upsert_match_result(match_obj=match_obj, match_json=match, summary=summary)
 
+        matchday_rows.setdefault(md_order, []).append((match_obj, match))
+
+    for md_order, rows in matchday_rows.items():
+        md_obj = matchday_by_order.get(md_order)
+        if md_obj is None:
+            continue
+        _compute_matchday_first_goal(matchday_obj=md_obj, match_rows=rows)
+
     return summary
+
 
 def _parse_last_changed(value: str) -> timezone.datetime:
     return parse_openligadb_datetime(value)
@@ -510,6 +591,8 @@ def _import_one_matchday(
         for t in Team.objects.filter(openligadb_team_id__in=seen_team_ids)
     }
 
+    match_rows: list[tuple[Match, dict[str, Any]]] = []
+
     for m in matches_in_group:
         if not isinstance(m, dict):
             continue
@@ -550,6 +633,10 @@ def _import_one_matchday(
 
         _upsert_match_result(match_obj=match_obj, match_json=m, summary=summary)
 
+        match_rows.append((match_obj, m))
+
+    _compute_matchday_first_goal(matchday_obj=matchday, match_rows=match_rows)
+
     matchday.openligadb_last_changed_at = last_changed_at
     matchday.save(update_fields=["openligadb_last_changed_at"])
 
@@ -559,66 +646,111 @@ def update_season_smart(
     league_shortcut: str,
     season_year: int,
     dry_run: bool = False,
+    last_changed_workers: int = 10,
 ) -> ImportSummary:
+    """
+    Smart update of season data by checking lastChanged timestamps of matchdays.
+    Only matchdays with changed data are re-imported.
+    """
     summary = ImportSummary(league=league_shortcut, season=season_year)
     season = _get_season_or_raise(league_shortcut=league_shortcut, season_year=season_year)
 
     groups = client.fetch_available_groups(league_shortcut, season_year)
     summary.groups_total = len(groups)
 
-    changed_groups = 0
-    matches_seen = 0
-    planned: list[tuple[int, str]] = []
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
 
-    for group in groups:
-        group_id = group.get("groupOrderID") or group.get("groupOrderId")
-        if not isinstance(group_id, int):
+    _log(
+        f"[update] league={league_shortcut} season={season_year} "
+        f"groups={summary.groups_total} dry_run={dry_run} workers={last_changed_workers}"
+    )
+
+    group_ids: list[int] = []
+    group_by_id: dict[int, dict[str, Any]] = {}
+    for idx, g in enumerate(groups, start=1):
+        gid = g.get("groupOrderID") or g.get("groupOrderId")
+        if not isinstance(gid, int):
+            _log(f"[update] skip group #{idx}: missing groupOrderID/groupOrderId")
             continue
+        group_ids.append(gid)
+        group_by_id[gid] = g
 
-        last_changed_raw = client.fetch_last_changed(league_shortcut, season_year, group_id)
-        try:
-            last_changed_at = _parse_last_changed(last_changed_raw)
-        except Exception as e:
-            print(f"[update] skip group {group_id}: cannot parse lastChanged '{last_changed_raw}': {e}")
-            continue
+    def _fetch_last_changed(gid: int) -> tuple[int, str, timezone.datetime]:
+        raw = client.fetch_last_changed(league_shortcut, season_year, gid)
+        dt = _parse_last_changed(raw)
+        return gid, raw, dt
 
+    last_changed_map: dict[int, tuple[str, timezone.datetime]] = {}
+    errors: list[tuple[int, str]] = []
+
+    with ThreadPoolExecutor(max_workers=last_changed_workers) as ex:
+        futures = {ex.submit(_fetch_last_changed, gid): gid for gid in group_ids}
+        for fut in as_completed(futures):
+            gid = futures[fut]
+            try:
+                _gid, raw, dt = fut.result()
+                last_changed_map[_gid] = (raw, dt)
+            except Exception as e:
+                errors.append((gid, str(e)))
+
+    if errors:
+        for gid, err in errors[:10]:
+            _log(f"[update] lastChanged error group {gid}: {err}")
+        if len(errors) > 10:
+            _log(f"[update] ... {len(errors) - 10} more lastChanged errors")
+
+    planned: list[tuple[int, str, timezone.datetime]] = []
+    for gid, (raw, dt) in last_changed_map.items():
         md = (
             Matchday.objects
-            .filter(season=season, order_id=group_id)
+            .filter(season=season, order_id=gid)
             .only("openligadb_last_changed_at")
             .first()
         )
         db_last_changed = md.openligadb_last_changed_at if md else None
+        has_changed = (db_last_changed is None) or (dt > db_last_changed)
+        if has_changed:
+            planned.append((gid, raw, dt))
 
-        has_changed = db_last_changed is None or last_changed_at > db_last_changed
-        if not has_changed:
+    planned.sort(key=lambda t: t[0])
+
+    summary.groups_with_matches = len(planned)
+
+    if dry_run:
+        _log(f"[update] planned changed groups: {len(planned)} (dry-run)")
+        for gid, raw, _ in planned[:10]:
+            _log(f"[update]   group {gid:>2} changed at {raw}")
+        return summary
+
+    matches_seen = 0
+
+    for idx, (gid, raw, dt) in enumerate(planned, start=1):
+        _log(f"[update] importing group {gid:>2} ({idx}/{len(planned)}) lastChanged={raw}")
+
+        try:
+            matches_in_group = client.fetch_matches_matchday(league_shortcut, season_year, gid)
+        except Exception as e:
+            _log(f"[update] group {gid}: fetch_matches_matchday failed: {e}")
             continue
 
-        changed_groups += 1
-        planned.append((group_id, last_changed_raw))
-
-        if dry_run:
-            continue
-
-        matches_in_group = client.fetch_matches_matchday(league_shortcut, season_year, group_id)
         matches_seen += len(matches_in_group)
 
         _import_one_matchday(
             season=season,
-            group_json=group,
+            group_json=group_by_id[gid],
             matches_in_group=matches_in_group,
-            last_changed_at=last_changed_at,
+            last_changed_at=dt,
             summary=summary,
         )
 
-    summary.groups_with_matches = changed_groups
     summary.matches_total = matches_seen
 
-    if dry_run:
-        print(f"[update] league={league_shortcut} season={season_year}")
-        print(f"groups checked: {summary.groups_total}")
-        print(f"groups changed: {len(planned)}")
-        for group_id, last_changed in sorted(planned)[:10]:
-            print(f"  group {group_id:>2} changed at {last_changed}")
+    _log(
+        f"[update] done: changed_groups={summary.groups_with_matches}, matches_fetched={matches_seen}, "
+        f"teams(created={summary.teams_created}, updated={summary.teams_updated}), "
+        f"matches(created={summary.matches_created}, updated={summary.matches_updated}), "
+        f"results(created={summary.results_created}, updated={summary.results_updated})"
+    )
 
     return summary
