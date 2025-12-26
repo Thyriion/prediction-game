@@ -25,12 +25,11 @@ def score_tip(
     result: MatchResult | None = getattr(match, "result", None)
     if result is None:
         return 0
-    if result.home_goals_ft is None or result.away_goals_ft is None:
+    if result.home_goals is None or result.away_goals is None:
         return 0
     
-    actual_home = int(result.home_goals_ft)
-    actual_away = int(result.away_goals_ft)
-
+    actual_home = int(result.home_goals)
+    actual_away = int(result.away_goals)
     predicted_home = int(tip.home_goals_predicted)
     predicted_away = int(tip.away_goals_predicted)
 

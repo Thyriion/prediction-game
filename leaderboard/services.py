@@ -39,11 +39,11 @@ def compute_leaderboard_for_season(*, season: Season, include_zero: bool = False
         .select_related("user")
         .filter(season=season)
         .annotate(
-            total_points=(
+            total_points_db=(
                 Coalesce(F("tips_points"), Value(0)) + Coalesce(F("bonus_points"), Value(0))
             )
         )
-        .order_by("-total_points", "-tips_points", "user_id")
+        .order_by("-total_points_db", "-tips_points", "user_id")
     )
 
     rows: list[LeaderboardRow] = []
@@ -53,7 +53,7 @@ def compute_leaderboard_for_season(*, season: Season, include_zero: bool = False
             LeaderboardRow(
                 user_id=user.pk,
                 display_name=_display_name(user),
-                points=int(entry.total_points),
+                points=int(entry.total_points_db),
                 tips_points=int(entry.tips_points),
                 bonus_points=int(entry.bonus_points),
             )
