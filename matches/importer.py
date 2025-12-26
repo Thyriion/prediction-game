@@ -262,22 +262,22 @@ def _upsert_match_result(*, match_obj: Match, match_json: dict[str, Any], summar
         MatchResult.objects.filter(match=match_obj).delete()
         return
 
-    home_ft, away_ft = score
+    home_goals, away_goals = score
 
     existing = (
         MatchResult.objects
         .filter(match=match_obj)
-        .only("home_goals_ft", "away_goals_ft")
+        .only("home_goals", "away_goals")
         .first()
     )
 
     if existing is not None:
-        if existing.home_goals_ft == home_ft and existing.away_goals_ft == away_ft:
+        if existing.home_goals == home_goals and existing.away_goals == away_goals:
             return
 
-        existing.home_goals_ft = home_ft
-        existing.away_goals_ft = away_ft
-        existing.save(update_fields=["home_goals_ft", "away_goals_ft"])
+        existing.home_goals = home_goals
+        existing.away_goals = away_goals
+        existing.save(update_fields=["home_goals", "away_goals"])
 
         if summary:
             summary.results_updated += 1
@@ -285,8 +285,8 @@ def _upsert_match_result(*, match_obj: Match, match_json: dict[str, Any], summar
 
     MatchResult.objects.create(
         match=match_obj,
-        home_goals_ft=home_ft,
-        away_goals_ft=away_ft,
+        home_goals=home_goals,
+        away_goals=away_goals,
     )
 
     if summary:

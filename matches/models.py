@@ -112,20 +112,26 @@ class Match(models.Model):
         result = getattr(self, "result", None)
         return (
             result is not None and
-            result.home_goals_ft is not None and
-            result.away_goals_ft is not None
+            result.home_goals is not None and
+            result.away_goals is not None
         )
     
 class MatchResult(models.Model):
     """
-    Represents the result of a match.
+    Represents the CURRENT live score of a match.
+    When match.is_finished == True, this is the final result.
     """
     match = models.OneToOneField(Match, on_delete=models.CASCADE, related_name="result")
-    home_goals_ft = models.SmallIntegerField(null=True, blank=True)
-    away_goals_ft = models.SmallIntegerField(null=True, blank=True)
+    home_goals = models.SmallIntegerField(null=True, blank=True)
+    away_goals = models.SmallIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["match__kickoff_at", "match__id"]
 
+    @property
+    def is_final(self) -> bool:
+        return self.match.is_finished
+
+
     def __str__(self):
-        return f"Result for {self.match}: {self.home_goals_ft}:{self.away_goals_ft}"
+        return f"Result for {self.match}: {self.home_goals}:{self.away_goals}"
