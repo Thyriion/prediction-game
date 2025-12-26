@@ -10,6 +10,8 @@ from matches.openligadb_client import OpenLigaDbClient
 from matches.importer import bootstrap_season, update_season_smart
 from matches.models import Season
 
+from leaderboard.services import recompute_leaderboard_for_season
+
 def _group_id(group_json: dict[str, Any]) -> int | None:
     """
     Extract groupOrderID from OpenLigaDB group JSON.
@@ -214,5 +216,29 @@ class Command(BaseCommand):
         except Exception as e:
             raise CommandError(str(e)) from e
 
+
+        if not dry_run:
+            should_recompute = (not dry_run) and (
+                    mode == "bootstrap"
+                    or summary.results_created > 0
+                    or summary.results_updated > 0
+                    or summary.groups_with_matches > 0
+                )
+            if should_recompute:
+                try:
+                    season = (Season.objects.select_related("league").get(league__shortcut=league, year=season_year))
+                except Season.DoesNotExist:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"[import_openligadb] cannot recompute leaderboard: season not found in DB after import: league={league} year={season_year}"
+                        )
+                    )
+                else:
+                    updated = recompute_leaderboard_for_season(season=season)
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"[import_openligadb] recomputed leaderboard for season: league={league} year={season_year} updated_entries={updated}"
+                        )
+                    )
         self.stdout.write(self.style.SUCCESS("[import_openligadb] done"))
         self.stdout.write(str(summary))
